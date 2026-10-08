@@ -369,8 +369,109 @@ class CookieJar {
 // GOOGLE DRIVE RESOLVER & STREAMING
 // -------------------------------------------------------------
 function parseGoogleDriveId(url) {
-  const match = url.match(/(?:drive\.google\.com\/(?:file\/d\/|open\?id=|uc\?id=|drive\/folders\/)|id=)([a-zA-Z0-9_-]{20,})/i);
-  return match ? match[1] : null;
+  if (!url) return null;
+  const trimmed = url.trim();
+  const match = trimmed.match(/(?:(?:drive|docs)\.google\.com\/(?:(?:file|drive)\/(?:u\/\d+\/)?(?:d|folders)\/|open\?id=|uc\?id=|file\/d\/)|id=)([a-zA-Z0-9_-]{20,})/i) ||
+                trimmed.match(/drive\.usercontent\.google\.com\/download\?[^#]*id=([a-zA-Z0-9_-]{20,})/i);
+  if (match) return match[1];
+  if (/^[a-zA-Z0-9_-]{25,55}$/.test(trimmed)) return trimmed;
+  return null;
+}
+
+function parseSizeToBytes(sizeStr) {
+  if (!sizeStr) return null;
+  const m = sizeStr.trim().match(/^([\d.]+)\s*([KMGTPE]?B?)$/i);
+  if (!m) return null;
+  const num = parseFloat(m[1]);
+  const unit = m[2].toUpperCase();
+  const mult = {
+    'B': 1,
+    'K': 1024, 'KB': 1024,
+    'M': 1024 * 1024, 'MB': 1024 * 1024,
+    'G': 1024 * 1024 * 1024, 'GB': 1024 * 1024 * 1024,
+    'T': 1024 * 1024 * 1024 * 1024, 'TB': 1024 * 1024 * 1024 * 1024
+  };
+  return Math.round(num * (mult[unit] || 1));
+}
+
+async function getGDriveFileInfo(fileId) {
+  let fileName = null;
+  let fileSize = null;
+  let sizeFormatted = null;
+  let mimeType = 'application/octet-stream';
+  let isPrivate = false;
+
+  // 1. Fetch public preview page for metadata (og:title, title, viewerData)
+  try {
+    const viewUrl = `https://drive.google.com/file/d/${fileId}/view`;
+    const viewRes = await fetch(viewUrl, {
+      headers: { 'User-Agent': DEFAULT_USER_AGENT },
+      redirect: 'follow',
+    });
+    
+    if (viewRes.url && viewRes.url.includes('accounts.google.com')) {
+      isPrivate = true;
+    } else if (viewRes.ok) {
+      const viewHtml = await viewRes.text();
+      const ogTitle = viewHtml.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i) ||
+                      viewHtml.match(/<meta\s+name="title"\s+content="([^"]+)"/i);
+      if (ogTitle && ogTitle[1] && !ogTitle[1].includes('Google Drive')) {
+        fileName = ogTitle[1].trim();
+      }
+
+      if (!fileName) {
+        const titleMatch = viewHtml.match(/<title>([^<]+)<\/title>/i);
+        if (titleMatch && titleMatch[1]) {
+          const clean = titleMatch[1].replace(/\s*-\s*Google Drive\s*$/i, '').trim();
+          if (clean && !clean.includes('Page not found') && !clean.includes('Error')) {
+            fileName = clean;
+          }
+        }
+      }
+
+      const vMatch = viewHtml.match(/window\.viewerData\s*=\s*(\{[\s\S]*?\});/);
+      if (vMatch) {
+        const titleMatch = vMatch[1].match(/'title':\s*'([^']+)'/);
+        if (titleMatch && titleMatch[1]) fileName = titleMatch[1];
+      }
+    }
+  } catch (e) {
+    console.warn('[GDrive View Notice]:', e.message);
+  }
+
+  // 2. Fetch download initiation page for virus scan warning & size info
+  try {
+    const dlUrl = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0`;
+    const dlRes = await fetch(dlUrl, {
+      headers: { 'User-Agent': DEFAULT_USER_AGENT },
+      redirect: 'manual',
+    });
+
+    const loc = dlRes.headers.get('location');
+    if (loc && loc.includes('accounts.google.com')) {
+      isPrivate = true;
+    }
+
+    if (dlRes.headers.get('content-type')?.includes('text/html')) {
+      const dlHtml = await dlRes.text();
+      const ucMatch = dlHtml.match(/class="uc-name-size"[^>]*>[\s\S]*?<a[^>]*>([^<]+)<\/a>\s*\(([^)]+)\)/i);
+      if (ucMatch) {
+        if (!fileName || fileName.startsWith('gdrive_file_')) {
+          fileName = ucMatch[1].trim();
+        }
+        sizeFormatted = ucMatch[2].trim();
+        fileSize = parseSizeToBytes(sizeFormatted);
+      }
+    }
+  } catch (e) {
+    console.warn('[GDrive DL Notice]:', e.message);
+  }
+
+  if (isPrivate) {
+    throw new Error('This Google Drive file is private or requires Google login permissions. Make sure permissions are set to "Anyone with the link".');
+  }
+
+  return { fileName, fileSize, sizeFormatted, mimeType };
 }
 
 async function getGDriveDownloadSession(fileId, existingJar = null) {
@@ -510,11 +611,15 @@ async function resolveGoogleDrive(url, baseUrl) {
   const fileId = parseGoogleDriveId(url);
   if (!fileId) throw new Error('Invalid Google Drive URL. Could not extract File ID.');
 
-  let fileName = `gdrive_file_${fileId.slice(0, 8)}`;
-  let fileSize = 'Direct stream';
-  let totalBytes = null;
-  let mimeType = 'application/octet-stream';
+  // 1. Fetch real drive metadata (name, size, permissions check)
+  const meta = await getGDriveFileInfo(fileId);
 
+  let fileName = meta.fileName || `gdrive_file_${fileId.slice(0, 8)}`;
+  let fileSize = meta.sizeFormatted || 'Direct stream';
+  let totalBytes = meta.fileSize || null;
+  let mimeType = meta.mimeType || 'application/octet-stream';
+
+  // 2. Refine exact byte metadata & probe download confirmation session
   try {
     const session = await getGDriveDownloadSession(fileId);
     let probeRes = session.initialResponse;
@@ -530,7 +635,7 @@ async function resolveGoogleDrive(url, baseUrl) {
       if (session.cookieJar) session.cookieJar.updateFromHeaders(probeRes.headers);
     }
 
-    if (probeRes.ok || probeRes.status === 206) {
+    if (probeRes && (probeRes.ok || probeRes.status === 206)) {
       const cd = probeRes.headers.get('content-disposition');
       if (cd && cd.includes('filename=')) {
         const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
@@ -552,6 +657,10 @@ async function resolveGoogleDrive(url, baseUrl) {
       }
       const ct = probeRes.headers.get('content-type');
       if (ct && !ct.includes('text/html')) mimeType = ct;
+
+      if (probeRes.body) {
+        probeRes.body.cancel().catch(() => {});
+      }
     }
   } catch (probeErr) {
     console.warn('[GDrive Probe Notice]:', probeErr.message);
@@ -564,6 +673,7 @@ async function resolveGoogleDrive(url, baseUrl) {
     type: 'file',
     name: fileName,
     size: totalBytes,
+    rawSize: totalBytes,
     sizeFormatted: fileSize,
     mimetype: mimeType,
     rawLink: `https://drive.google.com/uc?id=${fileId}&export=download`,

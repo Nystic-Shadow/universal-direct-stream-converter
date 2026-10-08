@@ -241,7 +241,7 @@ document.addEventListener('DOMContentLoaded', () => {
       metricBytes.textContent = raw ? `${Number(raw).toLocaleString()} B` : (result.sizeFormatted || 'Streaming Byte Pipeline');
 
       if (sName === 'Google Drive') {
-        metricPipeline.textContent = '64MB Chunk Sequential (Quota-Bypass)';
+        metricPipeline.textContent = 'Continuous Auto-Resuming Stream (Quota-Bypass)';
       } else {
         metricPipeline.textContent = 'Zero-Storage Raw Byte Pipe';
       }
