@@ -188,18 +188,21 @@ async function resolveGofile(url, password, customToken, baseUrl) {
         });
       }
       if (probeRes && (probeRes.ok || probeRes.status === 206)) {
-        const cl = probeRes.headers.get('content-length');
-        const cr = probeRes.headers.get('content-range');
-        if (cr) {
-          const totalMatch = cr.match(/\/(\d+)/);
-          if (totalMatch) probeSize = parseInt(totalMatch[1], 10);
-        } else if (cl) {
-          probeSize = parseInt(cl, 10);
-        }
+        const ct = probeRes.headers.get('content-type') || '';
         const cd = probeRes.headers.get('content-disposition');
-        if (cd && cd.includes('filename=')) {
-          const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
-          if (fnMatch) effectiveName = decodeURIComponent(fnMatch[1]);
+        if (!ct.includes('text/html') || (cd && cd.includes('attachment'))) {
+          const cl = probeRes.headers.get('content-length');
+          const cr = probeRes.headers.get('content-range');
+          if (cr) {
+            const totalMatch = cr.match(/\/(\d+)/);
+            if (totalMatch) probeSize = parseInt(totalMatch[1], 10);
+          } else if (cl) {
+            probeSize = parseInt(cl, 10);
+          }
+          if (cd && cd.includes('filename=')) {
+            const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+            if (fnMatch) effectiveName = decodeURIComponent(fnMatch[1]);
+          }
         }
       }
     } catch (_) {}
@@ -461,6 +464,9 @@ async function getGDriveFileInfo(fileId) {
         }
         sizeFormatted = ucMatch[2].trim();
         fileSize = parseSizeToBytes(sizeFormatted);
+        if (fileSize) {
+          sizeFormatted = formatBytes(fileSize);
+        }
       }
     }
   } catch (e) {
@@ -510,10 +516,13 @@ async function getGDriveDownloadSession(fileId, existingJar = null) {
 
     // Check for explicit Google Drive Quota / Rate limit error
     const quotaMatch = html.match(/<p class="uc-error-subcaption">([\s\S]*?)<\/p>/i) ||
-                       html.match(/Too many users have viewed or downloaded this file recently/i);
+                       html.match(/Too many users have viewed or downloaded this file recently/i) ||
+                       html.match(/Quota exceeded/i);
     if (quotaMatch) {
       const reason = typeof quotaMatch[1] === 'string' ? quotaMatch[1].replace(/<[^>]+>/g, '').trim() : 'Google Drive download quota exceeded for this file.';
-      throw new Error(`Google Drive Quota Error: ${reason}`);
+      const quotaErr = new Error(`Google Drive Quota Error: ${reason}`);
+      quotaErr.code = 'QUOTA_EXCEEDED';
+      throw quotaErr;
     }
 
     let confirmUrl = null;
@@ -588,6 +597,29 @@ async function getGDriveDownloadSession(fileId, existingJar = null) {
         jar.updateFromHeaders(finalRes.headers);
       }
 
+      // Check if the confirmed response is HTML (Quota Exceeded or Access Denied)
+      const finalCt = finalRes.headers.get('content-type') || '';
+      if (finalCt.includes('text/html')) {
+        const finalHtml = await finalRes.text();
+        const confQuotaMatch = finalHtml.match(/<p class="uc-error-subcaption">([\s\S]*?)<\/p>/i) ||
+                               finalHtml.match(/Too many users have viewed or downloaded this file recently/i) ||
+                               finalHtml.match(/Quota exceeded/i);
+        if (confQuotaMatch) {
+          const reason = typeof confQuotaMatch[1] === 'string'
+            ? confQuotaMatch[1].replace(/<[^>]+>/g, '').trim()
+            : 'Too many users have viewed or downloaded this file recently. Google limits daily download bandwidth for public files.';
+          const quotaErr = new Error(`Google Drive Quota Error: ${reason}`);
+          quotaErr.code = 'QUOTA_EXCEEDED';
+          throw quotaErr;
+        }
+
+        if (finalHtml.includes('Access denied') || finalHtml.includes('accounts.google.com')) {
+          const deniedErr = new Error('This Google Drive file is private or requires Google login permissions.');
+          deniedErr.code = 'ACCESS_DENIED';
+          throw deniedErr;
+        }
+      }
+
       return {
         url: finalUrl,
         cookieJar: jar,
@@ -618,6 +650,8 @@ async function resolveGoogleDrive(url, baseUrl) {
   let fileSize = meta.sizeFormatted || 'Direct stream';
   let totalBytes = meta.fileSize || null;
   let mimeType = meta.mimeType || 'application/octet-stream';
+  let quotaExceeded = false;
+  let quotaNotice = null;
 
   // 2. Refine exact byte metadata & probe download confirmation session
   try {
@@ -636,27 +670,37 @@ async function resolveGoogleDrive(url, baseUrl) {
     }
 
     if (probeRes && (probeRes.ok || probeRes.status === 206)) {
-      const cd = probeRes.headers.get('content-disposition');
-      if (cd && cd.includes('filename=')) {
-        const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
-        if (fnMatch) fileName = decodeURIComponent(fnMatch[1]);
-      }
-      const cr = probeRes.headers.get('content-range');
-      if (cr) {
-        const totalMatch = cr.match(/\/(\d+)/);
-        if (totalMatch) {
-          totalBytes = parseInt(totalMatch[1], 10);
-          fileSize = formatBytes(totalBytes);
+      const ct = probeRes.headers.get('content-type') || '';
+      const cd = probeRes.headers.get('content-disposition') || '';
+
+      // CRITICAL: NEVER overwrite file size with HTML response body (e.g. 2,040 byte quota page)!
+      if (!ct.includes('text/html') || cd.includes('attachment')) {
+        if (cd.includes('filename=')) {
+          const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+          if (fnMatch) fileName = decodeURIComponent(fnMatch[1]);
         }
+        const cr = probeRes.headers.get('content-range');
+        if (cr) {
+          const totalMatch = cr.match(/\/(\d+)/);
+          if (totalMatch) {
+            totalBytes = parseInt(totalMatch[1], 10);
+            fileSize = formatBytes(totalBytes);
+          }
+        } else {
+          const cl = probeRes.headers.get('content-length');
+          if (cl && parseInt(cl, 10) > 0) {
+            totalBytes = parseInt(cl, 10);
+            fileSize = formatBytes(totalBytes);
+          }
+        }
+        if (ct && !ct.includes('text/html')) mimeType = ct;
       } else {
-        const cl = probeRes.headers.get('content-length');
-        if (cl && parseInt(cl, 10) > 0) {
-          totalBytes = parseInt(cl, 10);
-          fileSize = formatBytes(totalBytes);
+        const probeHtml = await probeRes.text().catch(() => '');
+        if (probeHtml.includes('Quota exceeded') || probeHtml.includes('Too many users')) {
+          quotaExceeded = true;
+          quotaNotice = 'Google Drive daily download quota exceeded for this file (too many users have viewed or downloaded it recently). Google limits public bandwidth for 24 hours. Bypass tip: Open the link in Google Drive, click "Make a copy" to your own Google Drive account, and paste the copied link.';
         }
       }
-      const ct = probeRes.headers.get('content-type');
-      if (ct && !ct.includes('text/html')) mimeType = ct;
 
       if (probeRes.body) {
         probeRes.body.cancel().catch(() => {});
@@ -664,6 +708,20 @@ async function resolveGoogleDrive(url, baseUrl) {
     }
   } catch (probeErr) {
     console.warn('[GDrive Probe Notice]:', probeErr.message);
+    if (probeErr.code === 'QUOTA_EXCEEDED' || probeErr.message.includes('Quota') || probeErr.message.includes('Too many users')) {
+      quotaExceeded = true;
+      quotaNotice = 'Google Drive daily download quota exceeded for this file (too many users have viewed or downloaded it recently). Google limits public bandwidth for 24 hours. Bypass tip: Open the link in Google Drive, click "Make a copy" to your own Google Drive account, and paste the copied link.';
+    }
+  }
+
+  // Ensure totalBytes and sizeFormatted preserve real metadata from getGDriveFileInfo
+  if (!totalBytes && meta.fileSize) {
+    totalBytes = meta.fileSize;
+    fileSize = meta.sizeFormatted || formatBytes(totalBytes);
+  }
+  if (!fileSize || fileSize === '0 B' || fileSize === 'Direct stream') {
+    if (meta.sizeFormatted) fileSize = meta.sizeFormatted;
+    else if (totalBytes) fileSize = formatBytes(totalBytes);
   }
 
   const streamUrl = `${baseUrl}/api/stream?service=gdrive&id=${fileId}&name=${encodeURIComponent(fileName)}`;
@@ -678,6 +736,8 @@ async function resolveGoogleDrive(url, baseUrl) {
     mimetype: mimeType,
     rawLink: `https://drive.google.com/uc?id=${fileId}&export=download`,
     directStreamUrl: streamUrl,
+    quotaExceeded,
+    quotaNotice,
     curlCommand: `curl -L -O "${streamUrl}"`,
   };
 }
@@ -1064,7 +1124,23 @@ app.all('/api/stream', async (req, res) => {
       if (!fileId) return res.status(400).send('Missing Google Drive File ID');
 
       const clientRange = req.headers.range;
-      let session = await getGDriveDownloadSession(fileId);
+      let session;
+      try {
+        session = await getGDriveDownloadSession(fileId);
+      } catch (sessionErr) {
+        if (sessionErr.code === 'QUOTA_EXCEEDED' || sessionErr.message.includes('Quota') || sessionErr.message.includes('Too many users')) {
+          res.status(429);
+          if (req.headers.accept?.includes('application/json')) {
+            return res.json({
+              error: 'Google Drive Quota Exceeded',
+              message: sessionErr.message,
+              bypass: 'Open the file in Google Drive, select "Make a copy" to your own Google Drive, and stream from your copy.'
+            });
+          }
+          return res.send(`HTTP 429 - Google Drive Download Quota Exceeded\n\nGoogle Drive has temporarily locked downloads for this file because too many users downloaded it recently.\n\nBypass Solution:\n1. Open the file in Google Drive in your browser.\n2. Click "Make a copy" to copy it to your personal Google Drive account.\n3. Paste the URL of your copy into this converter to stream with a fresh quota.\n`);
+        }
+        throw sessionErr;
+      }
 
       // Probe metadata and total size if not already known
       let effectiveName = filename;
@@ -1083,18 +1159,22 @@ app.all('/api/stream', async (req, res) => {
       }
 
       if (probeRes.ok || probeRes.status === 206) {
-        const cd = probeRes.headers.get('content-disposition');
-        if (cd && cd.includes('filename=')) {
-          const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
-          if (fnMatch) effectiveName = decodeURIComponent(fnMatch[1]);
-        }
-        const cr = probeRes.headers.get('content-range');
-        if (cr) {
-          const totalMatch = cr.match(/\/(\d+)/);
-          if (totalMatch) totalSize = parseInt(totalMatch[1], 10);
-        } else {
-          const cl = probeRes.headers.get('content-length');
-          if (cl && parseInt(cl, 10) > 0) totalSize = parseInt(cl, 10);
+        const ct = probeRes.headers.get('content-type') || '';
+        const cd = probeRes.headers.get('content-disposition') || '';
+
+        if (!ct.includes('text/html') || cd.includes('attachment')) {
+          if (cd.includes('filename=')) {
+            const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+            if (fnMatch) effectiveName = decodeURIComponent(fnMatch[1]);
+          }
+          const cr = probeRes.headers.get('content-range');
+          if (cr) {
+            const totalMatch = cr.match(/\/(\d+)/);
+            if (totalMatch) totalSize = parseInt(totalMatch[1], 10);
+          } else {
+            const cl = probeRes.headers.get('content-length');
+            if (cl && parseInt(cl, 10) > 0) totalSize = parseInt(cl, 10);
+          }
         }
       }
 

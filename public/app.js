@@ -34,6 +34,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const copyStreamBtn = document.getElementById('copyStreamBtn');
   const downloadLinkBtn = document.getElementById('downloadLinkBtn');
 
+  // Quota Warning
+  const quotaWarningCard = document.getElementById('quotaWarningCard');
+  const quotaWarningMsg = document.getElementById('quotaWarningMsg');
+
   // Terminal Switcher
   const termTabs = document.querySelectorAll('.term-tab');
   const terminalCode = document.getElementById('terminalCode');
@@ -240,10 +244,23 @@ document.addEventListener('DOMContentLoaded', () => {
       const raw = result.rawSize || result.size;
       metricBytes.textContent = raw ? `${Number(raw).toLocaleString()} B` : (result.sizeFormatted || 'Streaming Byte Pipeline');
 
-      if (sName === 'Google Drive') {
-        metricPipeline.textContent = 'Continuous Auto-Resuming Stream (Quota-Bypass)';
+      if (result.quotaExceeded) {
+        if (quotaWarningCard) {
+          quotaWarningCard.classList.remove('hidden');
+          if (result.quotaNotice && quotaWarningMsg) {
+            quotaWarningMsg.textContent = result.quotaNotice;
+          }
+        }
+        metricPipeline.textContent = 'Quota-Locked by Google (Bypass Available)';
+        metricPipeline.classList.add('warning-pipeline');
       } else {
-        metricPipeline.textContent = 'Zero-Storage Raw Byte Pipe';
+        if (quotaWarningCard) quotaWarningCard.classList.add('hidden');
+        metricPipeline.classList.remove('warning-pipeline');
+        if (sName === 'Google Drive') {
+          metricPipeline.textContent = 'Continuous Auto-Resuming Stream';
+        } else {
+          metricPipeline.textContent = 'Zero-Storage Raw Byte Pipe';
+        }
       }
 
       directStreamInput.value = result.directStreamUrl || '';
@@ -380,5 +397,6 @@ document.addEventListener('DOMContentLoaded', () => {
     resultsSection.classList.add('hidden');
     fileResult.classList.add('hidden');
     folderResult.classList.add('hidden');
+    if (quotaWarningCard) quotaWarningCard.classList.add('hidden');
   }
 });
