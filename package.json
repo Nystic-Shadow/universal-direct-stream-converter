@@ -1,0 +1,34 @@
+{
+  "name": "universal-direct-stream-converter",
+  "version": "1.0.0",
+  "description": "Universal Direct Download & Streaming Converter for Gofile, Google Drive (Quota Bypass), MediaFire, MEGA, AnonFiles, and PixelDrain with 0 disk storage.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "direct-download",
+    "gofile",
+    "google-drive",
+    "google-drive-quota-bypass",
+    "mediafire",
+    "meganz",
+    "pixeldrain",
+    "anonfiles",
+    "remote-upload",
+    "stream-proxy",
+    "zero-storage",
+    "direct-link-generator",
+    "idm",
+    "curl",
+    "wget",
+    "aria2"
+  ],
+  "author": "Nystic-Shadow",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "megajs": "^1.3.10"
+  }
+}

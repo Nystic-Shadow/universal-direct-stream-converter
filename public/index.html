@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Universal Direct Stream & Link Converter | 0-Storage Multi-Cloud Bridge</title>
+  <meta name="description" content="Convert Gofile, Google Drive, MediaFire, MEGA, AnonFiles, and PixelDrain into direct, high-speed streaming links for Remote Upload, cURL, wget, IDM, and aria2c without cookies or quota blocks.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Ambient Background Lighting -->
+  <div class="ambient-glow glow-1"></div>
+  <div class="ambient-glow glow-2"></div>
+  <div class="ambient-glow glow-3"></div>
+
+  <main class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="status-pill">
+        <span class="status-indicator"></span>
+        <span class="status-text">Zero-Storage High-Speed CDN Stream Engine</span>
+      </div>
+      <h1 class="main-title">
+        Universal Direct Link <span class="gradient-text">& Stream Converter</span>
+      </h1>
+      <p class="main-subtitle">
+        Transform restricted file-host URLs into instant, direct binary streams for <strong>Remote Upload</strong>, <strong>cURL</strong>, <strong>wget</strong>, or <strong>IDM</strong> — with 0 disk storage, full resume support, and Google Drive quota bypass.
+      </p>
+
+      <!-- Supported Providers Bar -->
+      <div class="providers-bar" id="providersBar">
+        <div class="provider-pill" data-service="gofile">
+          <span class="pill-dot gofile"></span>
+          <span>Gofile</span>
+        </div>
+        <div class="provider-pill" data-service="gdrive">
+          <span class="pill-dot gdrive"></span>
+          <span>Google Drive</span>
+        </div>
+        <div class="provider-pill" data-service="mediafire">
+          <span class="pill-dot mediafire"></span>
+          <span>MediaFire</span>
+        </div>
+        <div class="provider-pill" data-service="mega">
+          <span class="pill-dot mega"></span>
+          <span>MEGA</span>
+        </div>
+        <div class="provider-pill" data-service="anonfiles">
+          <span class="pill-dot anonfiles"></span>
+          <span>AnonFiles</span>
+        </div>
+        <div class="provider-pill" data-service="pixeldrain">
+          <span class="pill-dot pixeldrain"></span>
+          <span>PixelDrain</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Generator Card -->
+    <div class="glass-card converter-card">
+      <form id="convertForm">
+        <div class="input-container">
+          <div class="input-header">
+            <label for="urlInput">Enter File or Folder URL</label>
+            <span class="auto-detect-label" id="detectedLabel">Auto-detecting provider</span>
+          </div>
+
+          <div class="input-field-wrapper" id="inputWrapper">
+            <div class="input-prefix-icon" id="prefixIcon">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+              </svg>
+            </div>
+            <input 
+              type="text" 
+              id="urlInput" 
+              placeholder="Paste Gofile, Google Drive, MediaFire, MEGA, AnonFiles, or PixelDrain link..." 
+              required
+              autocomplete="off"
+              spellcheck="false"
+            >
+            <div class="input-actions">
+              <button type="button" id="clearBtn" class="icon-action-btn hidden" title="Clear input">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+              </button>
+              <button type="button" id="pasteBtn" class="pill-action-btn" title="Paste from clipboard">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+                <span>Paste</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <button type="submit" id="submitBtn" class="primary-gradient-btn">
+          <span class="btn-text">Generate Direct Stream Link</span>
+          <div class="spinner hidden" id="spinner"></div>
+        </button>
+      </form>
+    </div>
+
+    <!-- Error Card -->
+    <div id="errorCard" class="glass-card error-glass-card hidden">
+      <div class="error-badge-icon">⚠️</div>
+      <div class="error-content">
+        <h3 id="errorTitle">Resolution Error</h3>
+        <p id="errorMsg"></p>
+      </div>
+    </div>
+
+    <!-- Results Section -->
+    <section id="resultsSection" class="results-wrapper hidden">
+      <!-- File Result Card -->
+      <div id="fileResult" class="glass-card result-glass-card hidden">
+        <!-- Result Header -->
+        <div class="result-top-bar">
+          <div class="file-lead">
+            <div class="file-icon-square">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+                <line x1="16" y1="13" x2="8" y2="13"></line>
+                <line x1="16" y1="17" x2="8" y2="17"></line>
+              </svg>
+            </div>
+            <div class="file-title-wrap">
+              <h2 id="fileName" class="file-name-text">filename.zip</h2>
+              <span id="fileMimeTag" class="file-mime-text">application/octet-stream</span>
+            </div>
+          </div>
+          <div class="result-top-badges">
+            <span id="serviceBadge" class="meta-tag provider-tag">☁️ Provider</span>
+            <span id="fileSizeBadge" class="meta-tag size-tag">📦 0 MB</span>
+          </div>
+        </div>
+
+        <!-- Metrics Grid -->
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <span class="metric-label">Provider</span>
+            <span class="metric-value" id="metricProvider">Google Drive</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Formatted Size</span>
+            <span class="metric-value" id="metricSize">109.45 GB</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Exact Bytes</span>
+            <span class="metric-value mono" id="metricBytes">117,520,651,100 B</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Streaming Pipeline</span>
+            <span class="metric-value highlight" id="metricPipeline">64MB Chunk Sequential</span>
+          </div>
+        </div>
+
+        <hr class="card-divider">
+
+        <!-- Direct Stream URL Section -->
+        <div class="stream-url-block">
+          <div class="block-header">
+            <div class="block-title">
+              <span>Direct Stream Link</span>
+              <span class="pill-mini">Bypasses 302 Redirects & Cookies</span>
+            </div>
+            <span class="hint-tag">Ready for Remote Uploaders</span>
+          </div>
+          <div class="stream-input-row">
+            <input type="text" id="directStreamInput" readonly class="code-font-input">
+            <button type="button" class="action-btn-copy" id="copyStreamBtn" data-target="directStreamInput">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+              </svg>
+              <span>Copy</span>
+            </button>
+            <a href="#" id="downloadLinkBtn" class="action-btn-download" target="_blank" rel="noopener">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+              </svg>
+              <span>Download</span>
+            </a>
+          </div>
+        </div>
+
+        <!-- Terminal Command Switcher -->
+        <div class="terminal-command-block">
+          <div class="terminal-header">
+            <div class="terminal-tabs">
+              <button type="button" class="term-tab active" data-tab="curl">cURL</button>
+              <button type="button" class="term-tab" data-tab="wget">wget</button>
+              <button type="button" class="term-tab" data-tab="aria2c">aria2c (16-Thread)</button>
+              <button type="button" class="term-tab" data-tab="python">Python</button>
+            </div>
+            <button type="button" class="copy-term-btn" id="copyTermBtn">Copy Command</button>
+          </div>
+          <div class="terminal-body">
+            <pre><code id="terminalCode" class="mono-code">curl -L -O "http://localhost:3000/api/stream?..."</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- Folder Result Container -->
+      <div id="folderResult" class="glass-card result-glass-card hidden">
+        <div class="folder-top-bar">
+          <div>
+            <h2 id="folderName" class="file-name-text">Folder Name</h2>
+            <p id="folderSubtitle" class="folder-subtitle-text">Multi-file archive</p>
+          </div>
+          <button id="copyAllFolderBtn" class="pill-action-btn">Copy All Stream Links</button>
+        </div>
+        <div id="folderItemsList" class="folder-items-grid"></div>
+      </div>
+    </section>
+
+    <!-- Architecture Features Grid -->
+    <section class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon">🚀</div>
+        <h3>500+ GB Multi-Gigabyte Ready</h3>
+        <p>Built with a 64 MB sequential chunking engine. Tested and verified on 100+ GB and 500+ GB archives with zero stalling or memory accumulation.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🛡️</div>
+        <h3>Google Drive Quota & Virus Scan Bypass</h3>
+        <p>Automatically handles confirmation UUID handshakes, extracts NID session cookies, and uses bounded Range requests to bypass Google's 200 HTML quota block.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">💾</div>
+        <h3>Zero Disk Storage Pipeline</h3>
+        <p>100% on-the-fly streaming. Raw bytes pipe directly from cloud CDNs into your client connection using Node backpressure flow control.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">⏩</div>
+        <h3>HTTP Range & Resume Support</h3>
+        <p>Full <code>Accept-Ranges: bytes</code> and <code>206 Partial Content</code> support. Works natively with multi-part download accelerators like IDM and aria2c.</p>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      <div class="footer-links">
+        <span>0-Config Docker Deployment</span>
+        <span>•</span>
+        <a href="/api/health" target="_blank" rel="noopener">API Health</a>
+        <span>•</span>
+        <a href="https://github.com/Nystic-Shadow" target="_blank" rel="noopener">GitHub</a>
+      </div>
+      <p class="footer-credit">Universal Direct Stream Converter &copy; 2026. Free, Open-Source & Self-Hostable.</p>
+    </footer>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
