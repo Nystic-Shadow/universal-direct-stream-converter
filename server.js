@@ -2,12 +2,15 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const path = require('path');
+const fs = require('fs');
+const vm = require('vm');
 const { Readable } = require('stream');
 const { File: MegaFile } = require('megajs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.enable('trust proxy');
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -18,8 +21,18 @@ const DEFAULT_SALT = process.env.GOFILE_SALT || '12af056dacea0b';
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 const DEFAULT_LANGUAGE = 'en-US';
 
-let cachedGofileToken = process.env.GOFILE_TOKEN || 'I8oNxxJagZmYKfK5IIac9n5kHacDn2at';
+const TOKEN_CACHE_FILE = path.join(__dirname, '.gofile_token');
+let cachedGofileToken = process.env.GOFILE_TOKEN || null;
+try {
+  if (fs.existsSync(TOKEN_CACHE_FILE)) {
+    const saved = fs.readFileSync(TOKEN_CACHE_FILE, 'utf8').trim();
+    if (saved) cachedGofileToken = saved;
+  }
+} catch (_) {}
+
 let currentGofileSalt = DEFAULT_SALT;
+let cachedWtGenerator = null;
+let wtScriptFetchTime = 0;
 
 function formatBytes(bytes) {
   if (!bytes || isNaN(bytes) || bytes === 0) return '0 B';
@@ -54,8 +67,52 @@ function detectService(rawUrl) {
 // -------------------------------------------------------------
 function computeGofileWT(accountToken, salt = currentGofileSalt, userAgent = DEFAULT_USER_AGENT, lang = DEFAULT_LANGUAGE) {
   const timeWindow = Math.floor(Date.now() / 1000 / 14400).toString();
-  const payload = `${userAgent}::${lang}::${accountToken}::${timeWindow}::${salt}`;
+  const payload = `${userAgent}::${lang}::${accountToken || ''}::${timeWindow}::${salt}`;
   return crypto.createHash('sha256').update(payload).digest('hex');
+}
+
+async function getDynamicGofileWT(token) {
+  const now = Date.now();
+  if (!cachedWtGenerator || now - wtScriptFetchTime > 3600000) {
+    try {
+      const res = await fetch('https://gofile.io/js/wt.obf.js', {
+        headers: { 'User-Agent': DEFAULT_USER_AGENT }
+      });
+      if (res.ok) {
+        const scriptText = await res.text();
+        const sandbox = {
+          console,
+          window: {},
+          globalThis: {},
+          self: {},
+          document: { createElement: () => ({}) },
+          navigator: { userAgent: DEFAULT_USER_AGENT },
+          crypto: crypto.webcrypto || require('crypto').webcrypto,
+        };
+        sandbox.window = sandbox;
+        sandbox.globalThis = sandbox;
+        sandbox.self = sandbox;
+        vm.createContext(sandbox);
+        vm.runInContext(scriptText, sandbox);
+        if (typeof sandbox.generateWT === 'function') {
+          cachedWtGenerator = sandbox.generateWT;
+          wtScriptFetchTime = now;
+        }
+      }
+    } catch (e) {
+      console.warn('[Gofile] Dynamic WT fetch warning:', e.message);
+    }
+  }
+
+  if (cachedWtGenerator) {
+    try {
+      return await cachedWtGenerator(token || '');
+    } catch (e) {
+      console.warn('[Gofile] Dynamic WT generation warning:', e.message);
+    }
+  }
+
+  return computeGofileWT(token, currentGofileSalt);
 }
 
 async function getGofileAccountToken(customToken) {
@@ -63,18 +120,23 @@ async function getGofileAccountToken(customToken) {
   if (cachedGofileToken) return cachedGofileToken;
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch('https://api.gofile.io/accounts', { method: 'POST', signal: controller.signal });
+    const timeout = setTimeout(() => controller.abort(), 6000);
+    const res = await fetch('https://api.gofile.io/accounts', {
+      method: 'POST',
+      headers: { 'User-Agent': DEFAULT_USER_AGENT },
+      signal: controller.signal
+    });
     clearTimeout(timeout);
     const data = await res.json();
     if (data?.status === 'ok' && data?.data?.token) {
       cachedGofileToken = data.data.token;
+      try { fs.writeFileSync(TOKEN_CACHE_FILE, cachedGofileToken, 'utf8'); } catch (_) {}
       return cachedGofileToken;
     }
   } catch (err) {
     console.warn('[Gofile] Account creation fallback:', err.message);
   }
-  return cachedGofileToken || 'I8oNxxJagZmYKfK5IIac9n5kHacDn2at';
+  return cachedGofileToken || null;
 }
 
 function parseGofileUrl(input) {
@@ -101,13 +163,41 @@ async function resolveGofile(url, password, customToken, baseUrl) {
   const token = await getGofileAccountToken(customToken);
 
   if (parsed.type === 'store_url') {
-    const streamUrl = `${baseUrl}/api/stream?service=gofile&url=${encodeURIComponent(parsed.originalUrl)}&name=${encodeURIComponent(parsed.filename)}&token=${encodeURIComponent(token)}`;
+    let probeSize = null;
+    let effectiveName = parsed.filename;
+    try {
+      const headRes = await fetch(parsed.originalUrl, {
+        method: 'HEAD',
+        headers: {
+          'User-Agent': DEFAULT_USER_AGENT,
+          Referer: 'https://gofile.io/',
+          ...(token ? { Cookie: `accountToken=${token}`, Authorization: `Bearer ${token}` } : {})
+        },
+        redirect: 'follow',
+      });
+      if (headRes.ok) {
+        const cl = headRes.headers.get('content-length');
+        if (cl) probeSize = parseInt(cl, 10);
+        const cd = headRes.headers.get('content-disposition');
+        if (cd && cd.includes('filename=')) {
+          const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+          if (fnMatch) effectiveName = decodeURIComponent(fnMatch[1]);
+        }
+      }
+    } catch (_) {}
+
+    const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : '';
+    const streamUrl = `${baseUrl}/api/stream?service=gofile&url=${encodeURIComponent(parsed.originalUrl)}&name=${encodeURIComponent(effectiveName)}${tokenQuery}`;
+
     return {
       id: parsed.contentId,
       service: 'Gofile',
       type: 'file',
-      name: parsed.filename,
-      sizeFormatted: 'Available on stream',
+      name: effectiveName,
+      size: probeSize,
+      rawSize: probeSize,
+      sizeFormatted: probeSize ? formatBytes(probeSize) : 'Direct Stream',
+      mimetype: 'application/octet-stream',
       rawLink: parsed.originalUrl,
       directStreamUrl: streamUrl,
       curlCommand: `curl -L -O "${streamUrl}"`,
@@ -115,7 +205,7 @@ async function resolveGofile(url, password, customToken, baseUrl) {
   }
 
   const contentId = parsed.contentId;
-  const wt = computeGofileWT(token, currentGofileSalt);
+  const wt = await getDynamicGofileWT(token);
   const queryParams = new URLSearchParams({ page: '1', pageSize: '100', sortField: 'name', sortDirection: '1' });
   if (password && password.trim()) {
     queryParams.set('password', crypto.createHash('sha256').update(password.trim()).digest('hex'));
@@ -123,15 +213,17 @@ async function resolveGofile(url, password, customToken, baseUrl) {
 
   const apiUrl = `https://api.gofile.io/contents/${encodeURIComponent(contentId)}?${queryParams.toString()}`;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 6000);
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  const apiHeaders = {
+    'X-BL': DEFAULT_LANGUAGE,
+    'User-Agent': DEFAULT_USER_AGENT,
+    Accept: 'application/json',
+  };
+  if (token) apiHeaders['Authorization'] = `Bearer ${token}`;
+  if (wt) apiHeaders['X-Website-Token'] = wt;
+
   const apiRes = await fetch(apiUrl, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'X-Website-Token': wt,
-      'X-BL': DEFAULT_LANGUAGE,
-      'User-Agent': DEFAULT_USER_AGENT,
-      Accept: 'application/json',
-    },
+    headers: apiHeaders,
     signal: controller.signal,
   });
   clearTimeout(timeout);
@@ -142,16 +234,19 @@ async function resolveGofile(url, password, customToken, baseUrl) {
   }
 
   const itemData = result.data;
+  const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : '';
+
   if (itemData.type === 'file') {
-    const streamUrl = `${baseUrl}/api/stream?service=gofile&url=${encodeURIComponent(itemData.link)}&name=${encodeURIComponent(itemData.name)}&token=${encodeURIComponent(token)}`;
+    const streamUrl = `${baseUrl}/api/stream?service=gofile&url=${encodeURIComponent(itemData.link)}&name=${encodeURIComponent(itemData.name)}${tokenQuery}`;
     return {
       id: itemData.id,
       service: 'Gofile',
       type: 'file',
       name: itemData.name,
       size: itemData.size,
+      rawSize: itemData.size,
       sizeFormatted: formatBytes(itemData.size),
-      mimetype: itemData.mimetype,
+      mimetype: itemData.mimetype || 'application/octet-stream',
       rawLink: itemData.link,
       directStreamUrl: streamUrl,
       curlCommand: `curl -L -O "${streamUrl}"`,
@@ -164,15 +259,37 @@ async function resolveGofile(url, password, customToken, baseUrl) {
   for (const childId of Object.keys(children)) {
     const child = children[childId];
     if (child.type === 'file') {
-      const streamUrl = `${baseUrl}/api/stream?service=gofile&url=${encodeURIComponent(child.link)}&name=${encodeURIComponent(child.name)}&token=${encodeURIComponent(token)}`;
+      const streamUrl = `${baseUrl}/api/stream?service=gofile&url=${encodeURIComponent(child.link)}&name=${encodeURIComponent(child.name)}${tokenQuery}`;
       files.push({
         id: child.id,
         name: child.name,
+        size: child.size,
+        rawSize: child.size,
         sizeFormatted: formatBytes(child.size),
-        mimetype: child.mimetype,
+        mimetype: child.mimetype || 'application/octet-stream',
         directStreamUrl: streamUrl,
+        curlCommand: `curl -L -O "${streamUrl}"`,
       });
     }
+  }
+
+  // If folder contains only 1 file, promote it for seamless single-click remote upload & stream
+  if (files.length === 1) {
+    const single = files[0];
+    return {
+      id: single.id,
+      service: 'Gofile',
+      type: 'file',
+      name: single.name,
+      size: single.size,
+      rawSize: single.rawSize,
+      sizeFormatted: single.sizeFormatted,
+      mimetype: single.mimetype,
+      directStreamUrl: single.directStreamUrl,
+      curlCommand: single.curlCommand,
+      folderName: itemData.name || 'Folder',
+      files,
+    };
   }
 
   return {
@@ -577,8 +694,9 @@ async function resolveAnonFiles(url, baseUrl) {
     throw new Error('Could not decode direct download link from AnonFiles page.');
   }
 
-  // Follow 302 redirect to retrieve direct CDN storage URL
+  // Follow 302 redirect to retrieve direct CDN storage URL and exact Content-Length
   let rawDownloadLink = intermediateLink;
+  let rawBytes = null;
   try {
     const headRes = await fetch(intermediateLink, {
       method: 'HEAD',
@@ -588,6 +706,17 @@ async function resolveAnonFiles(url, baseUrl) {
     const cdnLocation = headRes.headers.get('location');
     if (cdnLocation) {
       rawDownloadLink = cdnLocation;
+      try {
+        const cdnHead = await fetch(cdnLocation, {
+          method: 'HEAD',
+          headers: { 'User-Agent': DEFAULT_USER_AGENT, Referer: pageUrl },
+        });
+        const cl = cdnHead.headers.get('content-length');
+        if (cl) rawBytes = parseInt(cl, 10);
+      } catch (_) {}
+    } else {
+      const cl = headRes.headers.get('content-length');
+      if (cl) rawBytes = parseInt(cl, 10);
     }
   } catch (redirectErr) {
     console.warn('[AnonFiles] Redirect follow warning:', redirectErr.message);
@@ -599,8 +728,10 @@ async function resolveAnonFiles(url, baseUrl) {
     service: 'AnonFilesNew',
     type: 'file',
     name: fileName,
-    sizeFormatted: fileSize,
-    mimetype: 'Direct CDN Stream',
+    size: rawBytes,
+    rawSize: rawBytes,
+    sizeFormatted: rawBytes ? formatBytes(rawBytes) : fileSize,
+    mimetype: 'application/octet-stream',
     rawLink: rawDownloadLink,
     directStreamUrl: streamUrl,
     curlCommand: `curl -L -O "${streamUrl}"`,
@@ -617,8 +748,8 @@ app.post('/api/resolve', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Please provide a file URL.' });
     }
 
-    const host = req.get('host');
-    const protocol = req.protocol;
+    const host = req.get('x-forwarded-host') || req.get('host');
+    const protocol = req.get('x-forwarded-proto') || req.protocol;
     const baseUrl = `${protocol}://${host}`;
     const service = detectService(url);
 
@@ -653,9 +784,9 @@ app.post('/api/resolve', async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// GET /api/stream (Universal Streaming Proxy - 0 Disk Writes)
+// /api/stream (Universal Streaming Proxy - 0 Disk Writes)
 // -------------------------------------------------------------
-app.get('/api/stream', async (req, res) => {
+app.all('/api/stream', async (req, res) => {
   try {
     const service = req.query.service || detectService(req.query.url);
     const filename = req.query.name || 'download';
@@ -693,6 +824,10 @@ app.get('/api/stream', async (req, res) => {
       } else {
         res.status(200);
         res.setHeader('Content-Length', targetFile.size);
+      }
+
+      if (req.method === 'HEAD') {
+        return res.end();
       }
 
       const downloadStream = targetFile.download(downloadOpts);
@@ -739,6 +874,10 @@ app.get('/api/stream', async (req, res) => {
           if (val) res.setHeader(h, val);
         });
 
+        if (req.method === 'HEAD') {
+          return res.end();
+        }
+
         const bodyStream = Readable.fromWeb(directRes.body);
         req.on('close', () => bodyStream.destroy());
         return bodyStream.pipe(res);
@@ -772,6 +911,9 @@ app.get('/api/stream', async (req, res) => {
       }
 
       if (!totalSize) {
+        if (req.method === 'HEAD') {
+          return res.end();
+        }
         const bodyStream = Readable.fromWeb(probeRes.body);
         req.on('close', () => bodyStream.destroy());
         return bodyStream.pipe(res);
@@ -801,6 +943,10 @@ app.get('/api/stream', async (req, res) => {
       res.setHeader('Content-Type', 'application/octet-stream');
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Cache-Control', 'public, max-age=3600');
+
+      if (req.method === 'HEAD') {
+        return res.end();
+      }
 
       // High-performance streaming: 64MB chunks directly to client socket with backpressure & auto-retry
       let currentOffset = startOffset;
@@ -911,7 +1057,7 @@ app.get('/api/stream', async (req, res) => {
       return bodyStream.pipe(res);
     }
 
-    // 3. MediaFire, AnonFiles, Gofile, and Generic Streaming
+    // 3. MediaFire, AnonFiles, Gofile, PixelDrain, and Generic Streaming
     let targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Missing target URL');
 
@@ -924,7 +1070,10 @@ app.get('/api/stream', async (req, res) => {
     if (service === 'gofile') {
       const token = req.query.token || cachedGofileToken;
       upstreamHeaders['Referer'] = 'https://gofile.io/';
-      upstreamHeaders['Cookie'] = `accountToken=${token}`;
+      if (token) {
+        upstreamHeaders['Cookie'] = `accountToken=${token}`;
+        upstreamHeaders['Authorization'] = `Bearer ${token}`;
+      }
     } else if (service === 'mediafire') {
       upstreamHeaders['Referer'] = 'https://www.mediafire.com/';
       if (targetUrl.startsWith('https://download')) {
@@ -932,21 +1081,64 @@ app.get('/api/stream', async (req, res) => {
       }
     } else if (service === 'anonfiles') {
       upstreamHeaders['Referer'] = 'https://anonfilesnew.com/';
+    } else if (service === 'pixeldrain') {
+      upstreamHeaders['Referer'] = 'https://pixeldrain.com/';
     }
 
     if (req.headers.range) {
       upstreamHeaders['Range'] = req.headers.range;
     }
 
+    // Handle HEAD request for instant remote uploader discovery & zero bandwidth waste
+    if (req.method === 'HEAD') {
+      let headRes = null;
+      try {
+        headRes = await fetch(targetUrl, {
+          method: 'HEAD',
+          headers: upstreamHeaders,
+          redirect: 'follow',
+        });
+      } catch (_) {}
+
+      // Fallback to range probe if server denies HEAD
+      if (!headRes || !headRes.ok) {
+        try {
+          headRes = await fetch(targetUrl, {
+            method: 'GET',
+            headers: { ...upstreamHeaders, Range: 'bytes=0-0' },
+            redirect: 'follow',
+          });
+        } catch (_) {}
+      }
+
+      if (headRes && (headRes.ok || headRes.status === 206)) {
+        res.status(headRes.status === 206 && !req.headers.range ? 200 : headRes.status);
+        ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag'].forEach((h) => {
+          const val = headRes.headers.get(h);
+          if (val) res.setHeader(h, val);
+        });
+
+        // If client requested full file without range, extract total size from content-range
+        const cr = headRes.headers.get('content-range');
+        if (!req.headers.range && cr) {
+          const totalMatch = cr.match(/\/(\d+)/);
+          if (totalMatch) {
+            res.setHeader('Content-Length', totalMatch[1]);
+            res.removeHeader('Content-Range');
+          }
+        }
+
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`);
+        res.setHeader('Accept-Ranges', 'bytes');
+        return res.end();
+      }
+    }
+
     const upstreamRes = await fetch(targetUrl, {
       method: 'GET',
       headers: upstreamHeaders,
-      redirect: service === 'gofile' ? 'manual' : 'follow',
+      redirect: 'follow',
     });
-
-    if (service === 'gofile' && (upstreamRes.status === 302 || upstreamRes.status === 301)) {
-      return res.status(403).send('Gofile session expired or rejected. Provide a valid Gofile token in Advanced Options.');
-    }
 
     if (!upstreamRes.ok && upstreamRes.status !== 206) {
       return res.status(upstreamRes.status).send(`Upstream server returned HTTP ${upstreamRes.status}`);
@@ -958,17 +1150,21 @@ app.get('/api/stream', async (req, res) => {
       if (val) res.setHeader(h, val);
     });
 
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`);
+    res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'public, max-age=3600');
 
-    const bodyStream = Readable.fromWeb(upstreamRes.body);
-    bodyStream.on('error', (err) => {
-      console.error('[Stream Error]:', err.message);
-      if (!res.headersSent) res.status(500).end();
-    });
+    let isClientClosed = false;
+    req.on('close', () => { isClientClosed = true; });
 
-    req.on('close', () => bodyStream.destroy());
-    bodyStream.pipe(res);
+    for await (const chunk of upstreamRes.body) {
+      if (isClientClosed) break;
+      const canWrite = res.write(chunk);
+      if (!canWrite) {
+        await new Promise((resolve) => res.once('drain', resolve));
+      }
+    }
+    if (!isClientClosed) res.end();
   } catch (err) {
     console.error('[Stream Proxy Error]:', err.message);
     if (!res.headersSent) res.status(500).send(`Streaming proxy error: ${err.message}`);

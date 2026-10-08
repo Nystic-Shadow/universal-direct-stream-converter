@@ -194,140 +194,24 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!rawUrl) return;
 
     setLoading(true);
-    const baseUrl = window.location.origin;
-    const serviceKey = detectServiceKey(rawUrl);
-
-    // Non-Gofile Services
-    if (serviceKey !== 'gofile') {
-      try {
-        const res = await fetch('/api/resolve', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: rawUrl }),
-        });
-
-        const data = await res.json();
-        if (!res.ok || !data.success) {
-          throw new Error(data.error || 'Failed to resolve file URL');
-        }
-
-        displayResult(data.data);
-      } catch (err) {
-        showError('Resolution Failed', err.message);
-      } finally {
-        setLoading(false);
-      }
-      return;
-    }
-
-    // Gofile Flow
-    const gofileParsed = parseGofileInput(rawUrl);
-    if (!gofileParsed) {
-      showError('Invalid URL', 'Please enter a valid Gofile URL or Content ID.');
-      setLoading(false);
-      return;
-    }
-
-    if (gofileParsed.type === 'store_url') {
-      const token = await getClientToken();
-      const streamUrl = `${baseUrl}/api/stream?service=gofile&url=${encodeURIComponent(gofileParsed.originalUrl)}&name=${encodeURIComponent(gofileParsed.filename)}&token=${encodeURIComponent(token)}`;
-
-      displayResult({
-        service: 'Gofile',
-        type: 'file',
-        name: gofileParsed.filename,
-        sizeFormatted: 'Direct Stream',
-        mimetype: 'Direct Storage Stream',
-        rawLink: gofileParsed.originalUrl,
-        directStreamUrl: streamUrl,
-      });
-
-      setLoading(false);
-      return;
-    }
-
-    // Hybrid Gofile Browser / Server Resolution
-    let resolvedSuccess = false;
     try {
-      const token = await getClientToken();
-      const timeWindow = Math.floor(Date.now() / 1000 / 14400).toString();
-      const userAgent = navigator.userAgent;
-      const lang = navigator.language || 'en-US';
-      const wtPayload = `${userAgent}::${lang}::${token}::${timeWindow}::${DEFAULT_SALT}`;
-      const wt = await sha256Hex(wtPayload);
-
-      const res = await fetch(`https://api.gofile.io/contents/${gofileParsed.contentId}?wt=${wt}`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'X-Website-Token': wt,
-          'X-BL': lang,
-          Accept: 'application/json',
-        },
+      const res = await fetch('/api/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: rawUrl }),
       });
 
-      if (res.ok) {
-        const data = await res.json();
-        if (data.status === 'ok') {
-          const result = data.data;
-          if (result.type === 'file') {
-            const streamUrl = `${baseUrl}/api/stream?service=gofile&url=${encodeURIComponent(result.link)}&name=${encodeURIComponent(result.name)}&token=${encodeURIComponent(token)}`;
-            displayResult({
-              service: 'Gofile',
-              type: 'file',
-              name: result.name,
-              size: result.size,
-              sizeFormatted: formatBytes(result.size),
-              mimetype: result.mimetype,
-              rawLink: result.link,
-              directStreamUrl: streamUrl,
-            });
-          } else {
-            const files = [];
-            const children = result.children || {};
-            for (const cId of Object.keys(children)) {
-              const child = children[cId];
-              if (child.type === 'file') {
-                const streamUrl = `${baseUrl}/api/stream?service=gofile&url=${encodeURIComponent(child.link)}&name=${encodeURIComponent(child.name)}&token=${encodeURIComponent(token)}`;
-                files.push({
-                  name: child.name,
-                  sizeFormatted: formatBytes(child.size),
-                  mimetype: child.mimetype,
-                  directStreamUrl: streamUrl,
-                });
-              }
-            }
-            displayResult({
-              service: 'Gofile',
-              type: 'folder',
-              name: result.name || 'Gofile Folder',
-              files: files,
-            });
-          }
-          resolvedSuccess = true;
-        }
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Failed to resolve file URL');
       }
-    } catch (_) {}
 
-    if (!resolvedSuccess) {
-      try {
-        const res = await fetch('/api/resolve', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: rawUrl }),
-        });
-        const data = await res.json();
-        if (res.ok && data.success) {
-          displayResult(data.data);
-          resolvedSuccess = true;
-        } else {
-          throw new Error(data.error || 'Server resolution failed');
-        }
-      } catch (bErr) {
-        showError('Could not resolve Gofile link', bErr.message);
-      }
+      displayResult(data.data);
+    } catch (err) {
+      showError('Resolution Failed', err.message);
+    } finally {
+      setLoading(false);
     }
-
-    setLoading(false);
   });
 
   // Display Result
@@ -335,9 +219,13 @@ document.addEventListener('DOMContentLoaded', () => {
     currentResult = result;
     resultsSection.classList.remove('hidden');
 
-    if (result.type === 'file') {
+    if (result.type === 'file' || (result.type === 'folder' && result.directStreamUrl)) {
       fileResult.classList.remove('hidden');
-      folderResult.classList.add('hidden');
+      if (result.files && result.files.length > 1) {
+        folderResult.classList.remove('hidden');
+      } else {
+        folderResult.classList.add('hidden');
+      }
 
       const sName = result.service || 'File';
       fileName.textContent = result.name || 'download_file';
@@ -348,7 +236,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
       metricProvider.textContent = sName;
       metricSize.textContent = result.sizeFormatted || 'Direct Stream';
-      metricBytes.textContent = result.size ? `${Number(result.size).toLocaleString()} B` : 'Streaming';
+
+      const raw = result.rawSize || result.size;
+      metricBytes.textContent = raw ? `${Number(raw).toLocaleString()} B` : (result.sizeFormatted || 'Streaming Byte Pipeline');
 
       if (sName === 'Google Drive') {
         metricPipeline.textContent = '64MB Chunk Sequential (Quota-Bypass)';
