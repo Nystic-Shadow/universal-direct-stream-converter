@@ -140,7 +140,7 @@ async function getGofileAccountToken(customToken) {
 }
 
 function parseGofileUrl(input) {
-  const storeMatch = input.match(/https?:\/\/([^/]+\.gofile\.io)\/download\/(?:web|direct)\/([a-zA-Z0-9_-]+)(?:\/([^?#]+))?/i);
+  const storeMatch = input.match(/https?:\/\/([^/]+\.gofile\.io)\/download\/(?:(?:web|direct)\/)?([a-zA-Z0-9_-]+)(?:\/([^?#]+))?/i);
   if (storeMatch) {
     return {
       type: 'store_url',
@@ -166,7 +166,7 @@ async function resolveGofile(url, password, customToken, baseUrl) {
     let probeSize = null;
     let effectiveName = parsed.filename;
     try {
-      const headRes = await fetch(parsed.originalUrl, {
+      let probeRes = await fetch(parsed.originalUrl, {
         method: 'HEAD',
         headers: {
           'User-Agent': DEFAULT_USER_AGENT,
@@ -175,10 +175,28 @@ async function resolveGofile(url, password, customToken, baseUrl) {
         },
         redirect: 'follow',
       });
-      if (headRes.ok) {
-        const cl = headRes.headers.get('content-length');
-        if (cl) probeSize = parseInt(cl, 10);
-        const cd = headRes.headers.get('content-disposition');
+      if (!probeRes || !probeRes.ok) {
+        probeRes = await fetch(parsed.originalUrl, {
+          method: 'GET',
+          headers: {
+            'User-Agent': DEFAULT_USER_AGENT,
+            Referer: 'https://gofile.io/',
+            Range: 'bytes=0-0',
+            ...(token ? { Cookie: `accountToken=${token}`, Authorization: `Bearer ${token}` } : {})
+          },
+          redirect: 'follow',
+        });
+      }
+      if (probeRes && (probeRes.ok || probeRes.status === 206)) {
+        const cl = probeRes.headers.get('content-length');
+        const cr = probeRes.headers.get('content-range');
+        if (cr) {
+          const totalMatch = cr.match(/\/(\d+)/);
+          if (totalMatch) probeSize = parseInt(totalMatch[1], 10);
+        } else if (cl) {
+          probeSize = parseInt(cl, 10);
+        }
+        const cd = probeRes.headers.get('content-disposition');
         if (cd && cd.includes('filename=')) {
           const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
           if (fnMatch) effectiveName = decodeURIComponent(fnMatch[1]);
@@ -302,6 +320,52 @@ async function resolveGofile(url, password, customToken, baseUrl) {
 }
 
 // -------------------------------------------------------------
+// COOKIE JAR HELPER
+// -------------------------------------------------------------
+class CookieJar {
+  constructor(initialCookies = '') {
+    this.cookies = new Map();
+    if (initialCookies) {
+      this.parseAndAdd(initialCookies);
+    }
+  }
+
+  parseAndAdd(cookieStr) {
+    if (!cookieStr) return;
+    const parts = cookieStr.split(/,(?=\s*[a-zA-Z0-9_-]+=)/);
+    for (const part of parts) {
+      const item = part.trim().split(';')[0].trim();
+      const eqIdx = item.indexOf('=');
+      if (eqIdx > 0) {
+        const name = item.substring(0, eqIdx).trim();
+        const val = item.substring(eqIdx + 1).trim();
+        this.cookies.set(name, val);
+      }
+    }
+  }
+
+  updateFromHeaders(headers) {
+    if (!headers) return;
+    let rawList = [];
+    if (typeof headers.getSetCookie === 'function') {
+      rawList = headers.getSetCookie();
+    } else {
+      const single = headers.get('set-cookie');
+      if (single) rawList = [single];
+    }
+    for (const c of rawList) {
+      this.parseAndAdd(c);
+    }
+  }
+
+  getCookieHeader() {
+    return Array.from(this.cookies.entries())
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ');
+  }
+}
+
+// -------------------------------------------------------------
 // GOOGLE DRIVE RESOLVER & STREAMING
 // -------------------------------------------------------------
 function parseGoogleDriveId(url) {
@@ -309,82 +373,134 @@ function parseGoogleDriveId(url) {
   return match ? match[1] : null;
 }
 
-async function getGDriveDownloadSession(fileId) {
-  let cookieHeader = '';
+async function getGDriveDownloadSession(fileId, existingJar = null) {
+  const jar = existingJar || new CookieJar();
   let url = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0`;
 
   let res = await fetch(url, {
-    headers: { 'User-Agent': DEFAULT_USER_AGENT },
+    headers: {
+      'User-Agent': DEFAULT_USER_AGENT,
+      ...(jar.getCookieHeader() ? { Cookie: jar.getCookieHeader() } : {})
+    },
     redirect: 'manual',
   });
 
-  const initialSetCookie = res.headers.get('set-cookie');
-  if (initialSetCookie) {
-    cookieHeader = initialSetCookie.split(';')[0];
-  }
+  jar.updateFromHeaders(res.headers);
 
   let redirects = 0;
   while ((res.status === 301 || res.status === 302 || res.status === 303 || res.status === 307) && redirects < 5) {
     redirects++;
-    const setCookie = res.headers.get('set-cookie');
-    if (setCookie) {
-      cookieHeader = (cookieHeader ? cookieHeader + '; ' : '') + setCookie.split(';')[0];
-    }
     const loc = res.headers.get('location');
     if (!loc) break;
     url = loc.startsWith('http') ? loc : new URL(loc, url).toString();
     res = await fetch(url, {
       headers: {
         'User-Agent': DEFAULT_USER_AGENT,
-        ...(cookieHeader ? { Cookie: cookieHeader } : {})
+        ...(jar.getCookieHeader() ? { Cookie: jar.getCookieHeader() } : {})
       },
       redirect: 'manual',
     });
-    const loopSetCookie = res.headers.get('set-cookie');
-    if (loopSetCookie) {
-      cookieHeader = (cookieHeader ? cookieHeader + '; ' : '') + loopSetCookie.split(';')[0];
-    }
+    jar.updateFromHeaders(res.headers);
   }
 
   const contentType = res.headers.get('content-type') || '';
   if (contentType.includes('text/html')) {
     const html = await res.text();
-    const uuidMatch = html.match(/name="uuid"\s+value="([^"]+)"/i);
-    if (uuidMatch) {
-      const confirmUrl = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t&uuid=${uuidMatch[1]}`;
-      return {
-        url: confirmUrl,
-        cookie: cookieHeader,
-        isConfirmed: true,
-      };
+
+    // Check for explicit Google Drive Quota / Rate limit error
+    const quotaMatch = html.match(/<p class="uc-error-subcaption">([\s\S]*?)<\/p>/i) ||
+                       html.match(/Too many users have viewed or downloaded this file recently/i);
+    if (quotaMatch) {
+      const reason = typeof quotaMatch[1] === 'string' ? quotaMatch[1].replace(/<[^>]+>/g, '').trim() : 'Google Drive download quota exceeded for this file.';
+      throw new Error(`Google Drive Quota Error: ${reason}`);
     }
-    const formMatch = html.match(/<form[^>]*id="download-form"[^>]*>([\s\S]*?)<\/form>/i) ||
-                      html.match(/<form[^>]*action="([^"]*drive\.usercontent\.google\.com[^"]*)"[^>]*>([\s\S]*?)<\/form>/i);
-    if (formMatch) {
-      const formTag = formMatch[0].match(/action="([^"]+)"/i);
-      let formAction = formTag ? formTag[1].replace(/&amp;/g, '&') : url;
-      if (!formAction.startsWith('http')) formAction = new URL(formAction, url).toString();
 
-      const parsedUrl = new URL(formAction);
-      const inputRegex = /<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"/gi;
-      let inputMatch;
-      while ((inputMatch = inputRegex.exec(formMatch[0])) !== null) {
-        parsedUrl.searchParams.set(inputMatch[1], inputMatch[2]);
+    let confirmUrl = null;
+
+    // Pattern 1: UUID match in input or scripts
+    const uuidMatch = html.match(/name="uuid"\s+value="([^"]+)"/i) || html.match(/"uuid"\s*:\s*"([^"]+)"/i);
+    if (uuidMatch) {
+      confirmUrl = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t&uuid=${uuidMatch[1]}`;
+    }
+
+    // Pattern 2: Download form match
+    if (!confirmUrl) {
+      const formMatch = html.match(/<form[^>]*id="download-form"[^>]*>([\s\S]*?)<\/form>/i) ||
+                        html.match(/<form[^>]*action="([^"]*drive\.usercontent\.google\.com[^"]*)"[^>]*>([\s\S]*?)<\/form>/i);
+      if (formMatch) {
+        const formTag = formMatch[0].match(/action="([^"]+)"/i);
+        let formAction = formTag ? formTag[1].replace(/&amp;/g, '&') : url;
+        if (!formAction.startsWith('http')) formAction = new URL(formAction, url).toString();
+
+        const parsedUrl = new URL(formAction);
+        const inputRegex = /<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"/gi;
+        let inputMatch;
+        while ((inputMatch = inputRegex.exec(formMatch[0])) !== null) {
+          parsedUrl.searchParams.set(inputMatch[1], inputMatch[2]);
+        }
+        if (!parsedUrl.searchParams.has('id')) parsedUrl.searchParams.set('id', fileId);
+        if (!parsedUrl.searchParams.has('confirm')) parsedUrl.searchParams.set('confirm', 't');
+        confirmUrl = parsedUrl.toString();
       }
-      if (!parsedUrl.searchParams.has('id')) parsedUrl.searchParams.set('id', fileId);
-      if (!parsedUrl.searchParams.has('confirm')) parsedUrl.searchParams.set('confirm', 't');
+    }
+
+    // Pattern 3: downloadUrl in JavaScript
+    if (!confirmUrl) {
+      const dlUrlMatch = html.match(/"downloadUrl"\s*:\s*"([^"]+)"/i);
+      if (dlUrlMatch) {
+        confirmUrl = dlUrlMatch[1].replace(/\\u003d/g, '=').replace(/\\u0026/g, '&');
+      }
+    }
+
+    // Pattern 4: Direct href confirmation link
+    if (!confirmUrl) {
+      const hrefMatch = html.match(/href="(\/(?:uc|download)\?[^"]*export=download[^"]*)"/i);
+      if (hrefMatch) {
+        confirmUrl = `https://drive.usercontent.google.com${hrefMatch[1].replace(/&amp;/g, '&')}`;
+      }
+    }
+
+    if (confirmUrl) {
+      let finalUrl = confirmUrl;
+      let finalRes = await fetch(confirmUrl, {
+        headers: {
+          'User-Agent': DEFAULT_USER_AGENT,
+          ...(jar.getCookieHeader() ? { Cookie: jar.getCookieHeader() } : {})
+        },
+        redirect: 'manual',
+      });
+      jar.updateFromHeaders(finalRes.headers);
+
+      let confRedirects = 0;
+      while ((finalRes.status === 301 || finalRes.status === 302 || finalRes.status === 303 || finalRes.status === 307) && confRedirects < 5) {
+        confRedirects++;
+        const loc = finalRes.headers.get('location');
+        if (!loc) break;
+        finalUrl = loc.startsWith('http') ? loc : new URL(loc, finalUrl).toString();
+        finalRes = await fetch(finalUrl, {
+          headers: {
+            'User-Agent': DEFAULT_USER_AGENT,
+            ...(jar.getCookieHeader() ? { Cookie: jar.getCookieHeader() } : {})
+          },
+          redirect: 'manual',
+        });
+        jar.updateFromHeaders(finalRes.headers);
+      }
 
       return {
-        url: parsedUrl.toString(),
-        cookie: cookieHeader,
+        url: finalUrl,
+        cookieJar: jar,
+        cookie: jar.getCookieHeader(),
         isConfirmed: true,
+        initialResponse: finalRes,
       };
     }
   }
 
   return {
     url,
-    cookie: cookieHeader,
+    cookieJar: jar,
+    cookie: jar.getCookieHeader(),
     initialResponse: res,
     isConfirmed: false,
   };
@@ -401,43 +517,40 @@ async function resolveGoogleDrive(url, baseUrl) {
 
   try {
     const session = await getGDriveDownloadSession(fileId);
-    if (session.isConfirmed) {
-      const probeRes = await fetch(session.url, {
+    let probeRes = session.initialResponse;
+
+    if (!probeRes || (!probeRes.ok && probeRes.status !== 206)) {
+      probeRes = await fetch(session.url, {
         headers: {
           'User-Agent': DEFAULT_USER_AGENT,
           ...(session.cookie ? { Cookie: session.cookie } : {}),
           Range: 'bytes=0-1023',
         },
       });
-      if (probeRes.ok || probeRes.status === 206) {
-        const cd = probeRes.headers.get('content-disposition');
-        if (cd && cd.includes('filename=')) {
-          const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
-          if (fnMatch) fileName = decodeURIComponent(fnMatch[1]);
-        }
-        const cr = probeRes.headers.get('content-range');
-        if (cr) {
-          const totalMatch = cr.match(/\/(\d+)/);
-          if (totalMatch) {
-            totalBytes = parseInt(totalMatch[1], 10);
-            fileSize = formatBytes(totalBytes);
-          }
-        }
-        const ct = probeRes.headers.get('content-type');
-        if (ct && !ct.includes('text/html')) mimeType = ct;
-      }
-    } else if (session.initialResponse) {
-      const cd = session.initialResponse.headers.get('content-disposition');
+      if (session.cookieJar) session.cookieJar.updateFromHeaders(probeRes.headers);
+    }
+
+    if (probeRes.ok || probeRes.status === 206) {
+      const cd = probeRes.headers.get('content-disposition');
       if (cd && cd.includes('filename=')) {
         const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
         if (fnMatch) fileName = decodeURIComponent(fnMatch[1]);
       }
-      const cl = session.initialResponse.headers.get('content-length');
-      if (cl && parseInt(cl, 10) > 0) {
-        totalBytes = parseInt(cl, 10);
-        fileSize = formatBytes(totalBytes);
+      const cr = probeRes.headers.get('content-range');
+      if (cr) {
+        const totalMatch = cr.match(/\/(\d+)/);
+        if (totalMatch) {
+          totalBytes = parseInt(totalMatch[1], 10);
+          fileSize = formatBytes(totalBytes);
+        }
+      } else {
+        const cl = probeRes.headers.get('content-length');
+        if (cl && parseInt(cl, 10) > 0) {
+          totalBytes = parseInt(cl, 10);
+          fileSize = formatBytes(totalBytes);
+        }
       }
-      const ct = session.initialResponse.headers.get('content-type');
+      const ct = probeRes.headers.get('content-type');
       if (ct && !ct.includes('text/html')) mimeType = ct;
     }
   } catch (probeErr) {
@@ -835,108 +948,68 @@ app.all('/api/stream', async (req, res) => {
       return downloadStream.pipe(res);
     }
 
-    // 2. Google Drive Streaming (Handles virus scan confirmations, quota limits, and 500+ GB files)
+    // 2. Google Drive Streaming (Handles virus scan confirmations, quota limits, and 500+ GB continuous auto-resuming transfers)
     if (service === 'gdrive') {
       const fileId = req.query.id || parseGoogleDriveId(req.query.url);
       if (!fileId) return res.status(400).send('Missing Google Drive File ID');
 
       const clientRange = req.headers.range;
-      const session = await getGDriveDownloadSession(fileId);
+      let session = await getGDriveDownloadSession(fileId);
 
-      // Case A: Regular file without virus scan confirmation
-      if (!session.isConfirmed) {
-        let directRes = session.initialResponse;
-        if (clientRange) {
-          directRes = await fetch(session.url, {
-            headers: {
-              'User-Agent': DEFAULT_USER_AGENT,
-              ...(session.cookie ? { Cookie: session.cookie } : {}),
-              Range: clientRange,
-            },
-          });
-        }
+      // Probe metadata and total size if not already known
+      let effectiveName = filename;
+      let totalSize = null;
 
-        if (!directRes.ok && directRes.status !== 206) {
-          return res.status(directRes.status).send(`Google Drive returned HTTP ${directRes.status}`);
-        }
+      let probeRes = session.initialResponse;
+      if (!probeRes || (!probeRes.ok && probeRes.status !== 206)) {
+        probeRes = await fetch(session.url, {
+          headers: {
+            'User-Agent': DEFAULT_USER_AGENT,
+            ...(session.cookie ? { Cookie: session.cookie } : {}),
+            Range: 'bytes=0-1023',
+          },
+        });
+        if (session.cookieJar) session.cookieJar.updateFromHeaders(probeRes.headers);
+      }
 
-        const cd = directRes.headers.get('content-disposition');
-        let effectiveName = filename;
+      if (probeRes.ok || probeRes.status === 206) {
+        const cd = probeRes.headers.get('content-disposition');
         if (cd && cd.includes('filename=')) {
           const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
           if (fnMatch) effectiveName = decodeURIComponent(fnMatch[1]);
         }
-
-        res.status(directRes.status);
-        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(effectiveName)}"; filename*=UTF-8''${encodeURIComponent(effectiveName)}`);
-        ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control'].forEach((h) => {
-          const val = directRes.headers.get(h);
-          if (val) res.setHeader(h, val);
-        });
-
-        if (req.method === 'HEAD') {
-          return res.end();
+        const cr = probeRes.headers.get('content-range');
+        if (cr) {
+          const totalMatch = cr.match(/\/(\d+)/);
+          if (totalMatch) totalSize = parseInt(totalMatch[1], 10);
+        } else {
+          const cl = probeRes.headers.get('content-length');
+          if (cl && parseInt(cl, 10) > 0) totalSize = parseInt(cl, 10);
         }
-
-        const bodyStream = Readable.fromWeb(directRes.body);
-        req.on('close', () => bodyStream.destroy());
-        return bodyStream.pipe(res);
-      }
-
-      // Case B: Confirmed / Large file / Quota-protected file
-      const probeRes = await fetch(session.url, {
-        headers: {
-          'User-Agent': DEFAULT_USER_AGENT,
-          ...(session.cookie ? { Cookie: session.cookie } : {}),
-          Range: 'bytes=0-1023',
-        },
-      });
-
-      if (!probeRes.ok && probeRes.status !== 206) {
-        return res.status(probeRes.status).send(`Google Drive returned HTTP ${probeRes.status}`);
-      }
-
-      const cd = probeRes.headers.get('content-disposition');
-      let effectiveName = filename;
-      if (cd && cd.includes('filename=')) {
-        const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
-        if (fnMatch) effectiveName = decodeURIComponent(fnMatch[1]);
-      }
-
-      const cr = probeRes.headers.get('content-range');
-      let totalSize = null;
-      if (cr) {
-        const totalMatch = cr.match(/\/(\d+)/);
-        if (totalMatch) totalSize = parseInt(totalMatch[1], 10);
-      }
-
-      if (!totalSize) {
-        if (req.method === 'HEAD') {
-          return res.end();
-        }
-        const bodyStream = Readable.fromWeb(probeRes.body);
-        req.on('close', () => bodyStream.destroy());
-        return bodyStream.pipe(res);
       }
 
       // Range math
       let startOffset = 0;
-      let endLimit = totalSize - 1;
+      let endLimit = totalSize ? totalSize - 1 : null;
 
       if (clientRange) {
         const m = clientRange.match(/bytes=(\d+)-(\d+)?/);
         if (m) {
           startOffset = parseInt(m[1], 10);
-          if (m[2]) {
+          if (m[2] && totalSize) {
             endLimit = Math.min(parseInt(m[2], 10), totalSize - 1);
           }
         }
         res.status(206);
-        res.setHeader('Content-Range', `bytes ${startOffset}-${endLimit}/${totalSize}`);
-        res.setHeader('Content-Length', endLimit - startOffset + 1);
+        if (totalSize) {
+          res.setHeader('Content-Range', `bytes ${startOffset}-${endLimit}/${totalSize}`);
+          res.setHeader('Content-Length', endLimit - startOffset + 1);
+        }
       } else {
         res.status(200);
-        res.setHeader('Content-Length', totalSize);
+        if (totalSize) {
+          res.setHeader('Content-Length', totalSize);
+        }
       }
 
       res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(effectiveName)}"; filename*=UTF-8''${encodeURIComponent(effectiveName)}`);
@@ -948,7 +1021,7 @@ app.all('/api/stream', async (req, res) => {
         return res.end();
       }
 
-      // High-performance streaming: 64MB chunks directly to client socket with backpressure & auto-retry
+      // Continuous high-performance streaming with auto-resumption on session expiry/drop
       let currentOffset = startOffset;
       let isClientClosed = false;
 
@@ -956,61 +1029,99 @@ app.all('/api/stream', async (req, res) => {
         isClientClosed = true;
       });
 
-      const CHUNK_SIZE = 64 * 1024 * 1024; // 64 MB
       let currentSession = session;
+      let consecutiveFailures = 0;
+      const MAX_CONSECUTIVE_FAILURES = 10;
+      let lastError = null;
 
-      while (currentOffset <= endLimit && !isClientClosed) {
-        const chunkEnd = Math.min(currentOffset + CHUNK_SIZE - 1, endLimit);
-        let success = false;
-        let lastError = null;
+      while ((endLimit === null || currentOffset <= endLimit) && !isClientClosed) {
+        let bytesTransferredThisCycle = 0;
 
-        for (let attempt = 0; attempt < 5 && !isClientClosed; attempt++) {
-          try {
-            const chunkRes = await fetch(currentSession.url, {
-              headers: {
-                'User-Agent': DEFAULT_USER_AGENT,
-                ...(currentSession.cookie ? { Cookie: currentSession.cookie } : {}),
-                Range: `bytes=${currentOffset}-${chunkEnd}`,
-              },
-            });
+        try {
+          const rangeHeader = endLimit !== null 
+            ? `bytes=${currentOffset}-${endLimit}`
+            : `bytes=${currentOffset}-`;
 
-            // If token expired or returned HTML, refresh session
-            if (chunkRes.status === 403 || chunkRes.status === 401 || (chunkRes.headers.get('content-type') || '').includes('text/html')) {
-              console.log(`[GDrive] Session expired at byte ${currentOffset}. Refreshing session on-the-fly...`);
-              currentSession = await getGDriveDownloadSession(fileId);
-              continue;
+          const upstreamRes = await fetch(currentSession.url, {
+            headers: {
+              'User-Agent': DEFAULT_USER_AGENT,
+              ...(currentSession.cookie ? { Cookie: currentSession.cookie } : {}),
+              Range: rangeHeader,
+            },
+          });
+
+          // Update cookie jar from response headers
+          if (currentSession.cookieJar) {
+            currentSession.cookieJar.updateFromHeaders(upstreamRes.headers);
+            currentSession.cookie = currentSession.cookieJar.getCookieHeader();
+          }
+
+          // Check if session token expired or challenged with HTML / 403 / 401
+          const cType = upstreamRes.headers.get('content-type') || '';
+          if (upstreamRes.status === 403 || upstreamRes.status === 401 || cType.includes('text/html')) {
+            throw new Error(`Session expired or challenged (HTTP ${upstreamRes.status}, Content-Type: ${cType})`);
+          }
+
+          if (!upstreamRes.ok && upstreamRes.status !== 206) {
+            throw new Error(`Google Drive returned HTTP ${upstreamRes.status}`);
+          }
+
+          // Stream upstream body with drain backpressure
+          for await (const chunk of upstreamRes.body) {
+            if (isClientClosed) break;
+            currentOffset += chunk.length;
+            bytesTransferredThisCycle += chunk.length;
+
+            if (!res.write(chunk)) {
+              await new Promise((resolve) => res.once('drain', resolve));
             }
+          }
 
-            if (!chunkRes.ok && chunkRes.status !== 206) {
-              throw new Error(`Google Drive returned HTTP ${chunkRes.status}`);
-            }
+          // If we made byte progress during this cycle, reset consecutive failure counter
+          if (bytesTransferredThisCycle > 0) {
+            consecutiveFailures = 0;
+          }
 
-            // Stream chunk body directly with proper backpressure
-            for await (const chunk of chunkRes.body) {
-              if (isClientClosed) break;
-              currentOffset += chunk.length;
-              if (!res.write(chunk)) {
-                await new Promise((resolve) => res.once('drain', resolve));
-              }
-            }
-
-            success = true;
+          // If we reached the end of the requested range, complete successfully!
+          if (endLimit !== null && currentOffset > endLimit) {
             break;
-          } catch (err) {
-            lastError = err;
-            console.warn(`[GDrive Stream] Retry ${attempt + 1}/5 at byte ${currentOffset}: ${err.message}`);
-            await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-            try {
-              currentSession = await getGDriveDownloadSession(fileId);
-            } catch (_) {}
+          }
+
+          // If upstream closed connection normally and endLimit was not reached
+          if (bytesTransferredThisCycle === 0) {
+            consecutiveFailures++;
+            throw new Error('Zero bytes received from upstream connection');
+          }
+        } catch (err) {
+          lastError = err;
+          consecutiveFailures++;
+          console.warn(`[GDrive Stream] Connection interrupted at byte ${currentOffset}/${totalSize || 'unknown'}: ${err.message}. (Attempt ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES})`);
+
+          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES || isClientClosed) {
+            break;
+          }
+
+          // Exponential backoff before refreshing session
+          const delayMs = Math.min(1000 * Math.pow(1.5, consecutiveFailures - 1), 8000);
+          await new Promise((r) => setTimeout(r, delayMs));
+
+          // Refresh session with cookies preserved
+          try {
+            console.log(`[GDrive] Refreshing session on-the-fly at offset ${currentOffset}...`);
+            currentSession = await getGDriveDownloadSession(fileId, currentSession.cookieJar);
+          } catch (refreshErr) {
+            console.warn(`[GDrive] Session refresh warning: ${refreshErr.message}`);
           }
         }
+      }
 
-        if (!success && !isClientClosed) {
-          console.error(`[GDrive Stream Failed] Aborted at byte ${currentOffset}: ${lastError?.message}`);
-          if (!res.writableEnded) res.end();
-          return;
+      // Termination handling
+      if (endLimit !== null && currentOffset <= endLimit && !isClientClosed) {
+        console.error(`[GDrive Stream Fatal] Transfer incomplete. Transferred ${currentOffset}/${totalSize} bytes: ${lastError?.message}`);
+        if (!res.writableEnded) {
+          res.destroy(new Error(`Upstream transfer truncated at byte ${currentOffset}/${totalSize}: ${lastError?.message}`));
         }
+        return;
       }
 
       if (!isClientClosed && !res.writableEnded) {
@@ -1157,14 +1268,29 @@ app.all('/api/stream', async (req, res) => {
     let isClientClosed = false;
     req.on('close', () => { isClientClosed = true; });
 
+    const clHeader = upstreamRes.headers.get('content-length');
+    const expectedBytes = clHeader ? parseInt(clHeader, 10) : null;
+    let totalBytesSent = 0;
+
     for await (const chunk of upstreamRes.body) {
       if (isClientClosed) break;
+      totalBytesSent += chunk.length;
       const canWrite = res.write(chunk);
       if (!canWrite) {
         await new Promise((resolve) => res.once('drain', resolve));
       }
     }
-    if (!isClientClosed) res.end();
+
+    if (!isClientClosed) {
+      if (expectedBytes !== null && totalBytesSent < expectedBytes) {
+        console.error(`[Stream Error] Upstream connection truncated: sent ${totalBytesSent}/${expectedBytes} bytes`);
+        if (!res.writableEnded) {
+          res.destroy(new Error(`Upstream connection truncated: sent ${totalBytesSent}/${expectedBytes} bytes`));
+        }
+        return;
+      }
+      res.end();
+    }
   } catch (err) {
     console.error('[Stream Proxy Error]:', err.message);
     if (!res.headersSent) res.status(500).send(`Streaming proxy error: ${err.message}`);
