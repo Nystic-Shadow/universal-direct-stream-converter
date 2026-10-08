@@ -69,7 +69,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Detect Service
   function detectServiceKey(url) {
     if (!url) return null;
-    if (/drive\.google\.com/i.test(url)) return 'gdrive';
+    if (/(?:drive|docs)(?:\.usercontent)?\.google\.com|googleusercontent\.com/i.test(url)) return 'gdrive';
     if (/mediafire\.com/i.test(url)) return 'mediafire';
     if (/mega\.nz/i.test(url)) return 'mega';
     if (/anonfilesnew\.com/i.test(url)) return 'anonfiles';

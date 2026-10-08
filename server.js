@@ -49,7 +49,7 @@ function detectService(rawUrl) {
   if (!rawUrl) return null;
   const url = rawUrl.trim();
 
-  if (/drive\.google\.com/i.test(url)) return 'gdrive';
+  if (/(?:drive|docs)(?:\.usercontent)?\.google\.com|googleusercontent\.com/i.test(url)) return 'gdrive';
   if (/mediafire\.com/i.test(url)) return 'mediafire';
   if (/mega\.nz/i.test(url)) return 'mega';
   if (/anonfilesnew\.com/i.test(url)) return 'anonfiles';
@@ -374,8 +374,25 @@ class CookieJar {
 function parseGoogleDriveId(url) {
   if (!url) return null;
   const trimmed = url.trim();
-  const match = trimmed.match(/(?:(?:drive|docs)\.google\.com\/(?:(?:file|drive)\/(?:u\/\d+\/)?(?:d|folders)\/|open\?id=|uc\?id=|file\/d\/)|id=)([a-zA-Z0-9_-]{20,})/i) ||
-                trimmed.match(/drive\.usercontent\.google\.com\/download\?[^#]*id=([a-zA-Z0-9_-]{20,})/i);
+
+  // 1. Try URL parser for exact id query parameter or path
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname.includes('google.com') || parsed.hostname.includes('googleusercontent.com')) {
+      const idParam = parsed.searchParams.get('id');
+      if (idParam && /^[a-zA-Z0-9_-]{20,}$/.test(idParam)) {
+        return idParam;
+      }
+      const pathMatch = parsed.pathname.match(/\/(?:file|folders|d)\/(?:u\/\d+\/)?([a-zA-Z0-9_-]{20,})/i) ||
+                        parsed.pathname.match(/\/d\/([a-zA-Z0-9_-]{20,})/i);
+      if (pathMatch) return pathMatch[1];
+    }
+  } catch (_) {}
+
+  // 2. Regex fallback for varied structures
+  const match = trimmed.match(/(?:(?:drive|docs)\.google\.com\/(?:(?:file|drive)\/(?:u\/\d+\/)?(?:d|folders)\/|open\?id=|uc\?id=|file\/d\/)|[?&]id=)([a-zA-Z0-9_-]{20,})/i) ||
+                trimmed.match(/googleusercontent\.com\/[^#]*[?&]id=([a-zA-Z0-9_-]{20,})/i) ||
+                trimmed.match(/[?&]id=([a-zA-Z0-9_-]{20,})/i);
   if (match) return match[1];
   if (/^[a-zA-Z0-9_-]{25,55}$/.test(trimmed)) return trimmed;
   return null;
