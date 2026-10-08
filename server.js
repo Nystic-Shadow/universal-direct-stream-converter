@@ -575,6 +575,7 @@ async function getGDriveDownloadSession(fileId, existingJar = null) {
       let finalRes = await fetch(confirmUrl, {
         headers: {
           'User-Agent': DEFAULT_USER_AGENT,
+          Range: 'bytes=0-1023',
           ...(jar.getCookieHeader() ? { Cookie: jar.getCookieHeader() } : {})
         },
         redirect: 'manual',
@@ -590,6 +591,7 @@ async function getGDriveDownloadSession(fileId, existingJar = null) {
         finalRes = await fetch(finalUrl, {
           headers: {
             'User-Agent': DEFAULT_USER_AGENT,
+            Range: 'bytes=0-1023',
             ...(jar.getCookieHeader() ? { Cookie: jar.getCookieHeader() } : {})
           },
           redirect: 'manual',
@@ -1228,9 +1230,11 @@ app.all('/api/stream', async (req, res) => {
         let bytesTransferredThisCycle = 0;
 
         try {
-          const rangeHeader = endLimit !== null 
-            ? `bytes=${currentOffset}-${endLimit}`
-            : `bytes=${currentOffset}-`;
+          const GDRIVE_CHUNK_SIZE = 32 * 1024 * 1024; // 32 MB bounded chunk (bypasses Google Drive 200 quota block)
+          const chunkEnd = endLimit !== null 
+            ? Math.min(currentOffset + GDRIVE_CHUNK_SIZE - 1, endLimit)
+            : currentOffset + GDRIVE_CHUNK_SIZE - 1;
+          const rangeHeader = `bytes=${currentOffset}-${chunkEnd}`;
 
           const upstreamRes = await fetch(currentSession.url, {
             headers: {
